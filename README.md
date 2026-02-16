@@ -2,6 +2,8 @@
 
 Returns a random cute image (dog/cat/fox/badger/raccoon/opossum) from Reddit plus a random poetry line.
 
+It also keeps a history of previously used Reddit post IDs and skips repeats.
+
 ## Run locally
 
 ```bash
@@ -85,14 +87,46 @@ SERVICE_URL=$(gcloud run services describe cute-poetry --region "$REGION" --form
 curl "${SERVICE_URL}/?species=dog"
 ```
 
+### 7) Run every 6 hours (Cloud Scheduler)
+
+```bash
+gcloud services enable cloudscheduler.googleapis.com
+
+SERVICE_URL=$(gcloud run services describe cute-poetry --region "$REGION" --format='value(status.url)')
+gcloud scheduler jobs create http cute-poetry-every-6h \
+  --location="$REGION" \
+  --schedule="0 */6 * * *" \
+  --uri="${SERVICE_URL}/" \
+  --http-method=GET
+```
+
+If the job already exists, update it:
+
+```bash
+gcloud scheduler jobs update http cute-poetry-every-6h \
+  --location="$REGION" \
+  --schedule="0 */6 * * *" \
+  --uri="${SERVICE_URL}/" \
+  --http-method=GET
+```
+
 ## AWS Lambda
 
 Use handler: `cute_poetry_service.lambda_handler`
 
 For API Gateway, pass query param `species` if needed.
 
+## Local cron (every 6 hours)
+
+```bash
+cd "/home/user/Documents/x script"
+(crontab -l 2>/dev/null; echo '0 */6 * * * cd "/home/user/Documents/x script" && /usr/bin/python3 cute_poetry_service.py --once >> /tmp/cute_poetry.log 2>&1') | crontab -
+```
+
 ## Notes
 
 - Poetry lines are fetched from PoetryDB (`https://poetrydb.org/random/20`) with a small local fallback list.
 - A basic profanity mask is applied to the Reddit title and poetry line.
 - Reddit rate limits anonymous traffic; set `USER_AGENT` via Secret Manager.
+- Duplicate prevention uses `HISTORY_FILE` (default: `/tmp/cute_poetry_history.json`) and stores up to `MAX_HISTORY_ITEMS` (default: `2000`).
+- `/tmp` is ephemeral on serverless runtimes, so duplicate history may reset when instances restart.
