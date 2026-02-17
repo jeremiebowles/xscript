@@ -18,6 +18,7 @@ import json
 import os
 import random
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
 
 import requests
@@ -25,6 +26,10 @@ from flask import Flask, jsonify, request
 
 USER_AGENT = os.getenv("USER_AGENT", "cute-poetry-bot/1.0 (+https://example.local)")
 REDDIT_BASE = "https://www.reddit.com"
+REDDIT_OAUTH_BASE = "https://oauth.reddit.com"
+REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
 POETRY_API_URL = os.getenv("POETRY_API_URL", "https://poetrydb.org/random/20")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/tmp/cute_poetry_history.json")
@@ -59,6 +64,9 @@ FALLBACK_POETRY_LINES = [
     "Do not go gentle into that good night.",
 ]
 
+_REDDIT_ACCESS_TOKEN: Optional[str] = None
+_REDDIT_ACCESS_TOKEN_EXPIRY: float = 0.0
+
 
 def censor_text(text: str) -> str:
     """Basic profanity censorship by masking inner letters."""
@@ -75,9 +83,47 @@ def censor_text(text: str) -> str:
     return re.sub(r"\b[a-zA-Z']+\b", _mask, text)
 
 
+def _get_reddit_access_token() -> str:
+    global _REDDIT_ACCESS_TOKEN, _REDDIT_ACCESS_TOKEN_EXPIRY
+
+    now = time.time()
+    if _REDDIT_ACCESS_TOKEN and now < _REDDIT_ACCESS_TOKEN_EXPIRY:
+        return _REDDIT_ACCESS_TOKEN
+
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        raise RuntimeError("Missing Reddit API credentials.")
+
+    resp = requests.post(
+        REDDIT_TOKEN_URL,
+        auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+        data={"grant_type": "client_credentials"},
+        headers={"User-Agent": USER_AGENT},
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    token_data = resp.json()
+    token = token_data.get("access_token")
+    expires_in = int(token_data.get("expires_in", 3600))
+
+    if not token:
+        raise RuntimeError("Reddit token response missing access_token.")
+
+    _REDDIT_ACCESS_TOKEN = str(token)
+    _REDDIT_ACCESS_TOKEN_EXPIRY = now + max(60, expires_in - 60)
+    return _REDDIT_ACCESS_TOKEN
+
+
 def reddit_json(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    query = dict(params or {})
+    query["raw_json"] = 1
     headers = {"User-Agent": USER_AGENT}
-    resp = requests.get(f"{REDDIT_BASE}{path}", headers=headers, params=params or {}, timeout=REQUEST_TIMEOUT)
+
+    base_url = REDDIT_BASE
+    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+        base_url = REDDIT_OAUTH_BASE
+        headers["Authorization"] = f"bearer {_get_reddit_access_token()}"
+
+    resp = requests.get(f"{base_url}{path}", headers=headers, params=query, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -168,7 +214,10 @@ def pick_image_post(species: Optional[str] = None, seen_keys: Optional[Set[str]]
                 "post_url": f"https://reddit.com{post.get('permalink', '')}",
             }
 
-    raise RuntimeError(f"No new unused image post found for species '{selected_species}'.")
+    raise RuntimeError(
+        f"No new unused image post found for species '{selected_species}'. "
+        "If Reddit returns 403, configure REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET."
+    )
 
 
 def pick_poetry_line() -> str:
