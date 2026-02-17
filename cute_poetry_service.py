@@ -18,11 +18,17 @@ import json
 import os
 import random
 import re
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Set
 
 import requests
 from flask import Flask, jsonify, request
+
+try:
+    import tweepy
+except ImportError:
+    tweepy = None
 
 USER_AGENT = os.getenv("USER_AGENT", "cute-poetry-bot/1.0 (+https://example.local)")
 REDDIT_BASE = "https://www.reddit.com"
@@ -34,6 +40,11 @@ POETRY_API_URL = os.getenv("POETRY_API_URL", "https://poetrydb.org/random/20")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/tmp/cute_poetry_history.json")
 MAX_HISTORY_ITEMS = int(os.getenv("MAX_HISTORY_ITEMS", "2000"))
+X_API_KEY = os.getenv("X_API_KEY", "").strip()
+X_API_SECRET = os.getenv("X_API_SECRET", "").strip()
+X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN", "").strip()
+X_ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET", "").strip()
+X_POST_ENABLED = os.getenv("X_POST_ENABLED", "false").strip().lower() == "true"
 
 SUBREDDITS_BY_SPECIES: Dict[str, List[str]] = {
     "dog": ["rarepuppers", "dogs", "dogpictures"],
@@ -172,6 +183,90 @@ def add_history_key(history: List[str], key: str) -> List[str]:
     return filtered[-MAX_HISTORY_ITEMS:]
 
 
+def truncate_tweet_text(text: str, max_chars: int = 280) -> str:
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def get_x_credentials() -> Dict[str, str]:
+    creds = {
+        "X_API_KEY": X_API_KEY,
+        "X_API_SECRET": X_API_SECRET,
+        "X_ACCESS_TOKEN": X_ACCESS_TOKEN,
+        "X_ACCESS_TOKEN_SECRET": X_ACCESS_TOKEN_SECRET,
+    }
+    missing = [name for name, value in creds.items() if not value]
+    if missing:
+        raise RuntimeError(f"Missing X credentials: {', '.join(missing)}")
+    return creds
+
+
+def _download_image_to_temp_file(image_url: str) -> str:
+    ext = ".jpg"
+    lower = image_url.lower()
+    for candidate in ALLOWED_EXTENSIONS:
+        if lower.endswith(candidate):
+            ext = candidate
+            break
+
+    resp = requests.get(image_url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
+        tmp_file.write(resp.content)
+        return tmp_file.name
+
+
+def post_combo_to_x(combo: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
+    text = truncate_tweet_text(combo.get("caption", "").strip())
+    image_url = combo.get("image_url", "")
+
+    if dry_run:
+        return {
+            "posted": False,
+            "dry_run": True,
+            "text": text,
+            "image_url": image_url,
+        }
+
+    if tweepy is None:
+        raise RuntimeError("tweepy is not installed. Run: pip install -r requirements.txt")
+
+    creds = get_x_credentials()
+    local_image_path = _download_image_to_temp_file(image_url)
+    try:
+        auth = tweepy.OAuth1UserHandler(
+            creds["X_API_KEY"],
+            creds["X_API_SECRET"],
+            creds["X_ACCESS_TOKEN"],
+            creds["X_ACCESS_TOKEN_SECRET"],
+        )
+        api_v1 = tweepy.API(auth)
+        media = api_v1.media_upload(filename=local_image_path)
+
+        client = tweepy.Client(
+            consumer_key=creds["X_API_KEY"],
+            consumer_secret=creds["X_API_SECRET"],
+            access_token=creds["X_ACCESS_TOKEN"],
+            access_token_secret=creds["X_ACCESS_TOKEN_SECRET"],
+        )
+        tweet_response = client.create_tweet(text=text, media_ids=[media.media_id_string])
+        tweet_id = tweet_response.data.get("id") if tweet_response and tweet_response.data else None
+        return {
+            "posted": True,
+            "dry_run": False,
+            "tweet_id": str(tweet_id) if tweet_id else None,
+            "text": text,
+        }
+    finally:
+        try:
+            os.remove(local_image_path)
+        except OSError:
+            pass
+
+
 def pick_image_post(species: Optional[str] = None, seen_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
     seen = seen_keys or set()
     species_choices = list(SUBREDDITS_BY_SPECIES.keys())
@@ -306,11 +401,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cute animal + poetry service")
     parser.add_argument("--once", action="store_true", help="Run once and print JSON result")
     parser.add_argument("--species", type=str, default=None, help="Optional species override")
+    parser.add_argument("--post-x", action="store_true", help="Post generated combo to X")
+    parser.add_argument("--dry-run", action="store_true", help="Do not post to X, only print payload")
     args = parser.parse_args()
 
     if args.once:
-        print(json.dumps(generate_combo(species=args.species)))
+        combo = generate_combo(species=args.species)
+        output: Dict[str, Any] = dict(combo)
+
+        if args.post_x:
+            output["x_post"] = post_combo_to_x(combo, dry_run=args.dry_run)
+        elif args.dry_run:
+            output["x_post"] = post_combo_to_x(combo, dry_run=True)
+
+        print(json.dumps(output))
         return
+
+    if args.post_x and not X_POST_ENABLED:
+        raise RuntimeError("Set X_POST_ENABLED=true for non-once mode posting.")
 
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)

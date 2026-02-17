@@ -19,6 +19,29 @@ curl "http://localhost:8080/?species=dog"
 
 `species` is optional. Allowed values: `dog`, `cat`, `fox`, `badger`, `raccoon`, `opossum`.
 
+## Test X posting
+
+Generate one combo and preview what would be posted (no live post):
+
+```bash
+python3 cute_poetry_service.py --once --species dog --dry-run
+```
+
+Live post to X (requires credentials):
+
+```bash
+export X_API_KEY="..."
+export X_API_SECRET="..."
+export X_ACCESS_TOKEN="..."
+export X_ACCESS_TOKEN_SECRET="..."
+python3 cute_poetry_service.py --once --species dog --post-x
+```
+
+Notes:
+- `--post-x` performs a real post.
+- `--dry-run` never posts and only returns the payload.
+- The script uploads the Reddit image and posts the generated caption as tweet text.
+
 ## Cloud Run
 
 Use Google Secret Manager so runtime config is never committed to code or plain env files.
